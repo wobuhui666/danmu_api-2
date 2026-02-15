@@ -8,6 +8,7 @@ import { previewJsContent } from "./js/preview.js";
 import { logviewJsContent } from "./js/logview.js";
 import { apitestJsContent } from "./js/apitest.js";
 import { pushDanmuJsContent } from "./js/pushdanmu.js";
+import { requestRecordsJsContent } from "./js/requestrecords.js";
 import { systemSettingsJsContent } from "./js/systemsettings.js";
 
 // language=HTML
@@ -19,6 +20,7 @@ export const HTML_TEMPLATE = /* html */ `
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LogVar弹幕API</title>
     <link rel="icon" type="image/jpg" href="https://i.mji.rip/2025/09/27/eedc7b701c0fa5c1f7c175b22f441ad9.jpeg">
+    <link rel="apple-touch-icon" href="https://i.mji.rip/2025/09/27/eedc7b701c0fa5c1f7c175b22f441ad9.jpeg">
     <style>${baseCssContent}</style>
     <style>${componentsCssContent}</style>
     <style>${formsCssContent}</style>
@@ -53,6 +55,7 @@ export const HTML_TEMPLATE = /* html */ `
                 <button class="nav-btn" onclick="switchSection('logs', event)">日志查看</button>
                 <button class="nav-btn" onclick="switchSection('api', event)">接口调试</button>
                 <button class="nav-btn" onclick="switchSection('push', event)">推送弹幕</button>
+                <button class="nav-btn" onclick="switchSection('request-records', event)">请求记录</button>
                 <button class="nav-btn" onclick="switchSection('env', event)" id="env-nav-btn">系统配置</button>
             </div>
         </div>
@@ -61,6 +64,19 @@ export const HTML_TEMPLATE = /* html */ `
             <!-- 配置预览 -->
             <div class="section active" id="preview-section">
                 <h2>配置预览</h2>
+                
+                <div id="proxy-config-container" style="display: none; background: #fff3cd; border: 1px solid #ffeeba; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+                    <h3 style="color: #856404; margin-top: 0; font-size: 16px;">⚠️ 获取配置失败</h3>
+                    <p style="color: #856404; margin-bottom: 10px; font-size: 14px;">
+                        检测到无法获取配置。如果您使用了复杂的反向代理：例如将 <code>http://{ip}:9321/</code> 代理到了 <code>http://{ip}:9321/danmu_api/</code>，请在此处手动输入完整的反代后链接（不包含TOKEN和ADMIN_TOKEN的）
+                    </p>
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                        <input type="text" id="custom-base-url" placeholder="例如: http://192.168.8.1:2333/danmu_api/ (留空保存即恢复默认)" style="flex: 1; min-width: 200px; padding: 8px; border: 1px solid #ced4da; border-radius: 4px;">
+                        <button class="btn btn-primary" onclick="saveBaseUrl()">保存并刷新</button>
+                    </div>
+                    <p style="color: #666; font-size: 12px; margin-top: 5px;">* 设置将保存在浏览器本地存储中，清除网页的‘本地存储空间’或者输入框中留空并保存可恢复默认</p>
+                </div>
+
                 <p style="color: #666; margin-bottom: 20px;">当前生效的环境变量配置</p>
                 <div class="preview-area" id="preview-area"></div>
             </div>
@@ -127,6 +143,19 @@ export const HTML_TEMPLATE = /* html */ `
                 </div>
                 <div id="push-anime-list" class="anime-list" style="display: none;"></div>
                 <div id="push-episode-list" class="episode-list" style="display: none; margin-top: 20px;"></div>
+            </div>
+
+            <!-- 请求记录 -->
+            <div class="section" id="request-records-section">
+                <h2>请求记录</h2>
+                <div class="log-controls">
+                    <div>
+                        <button class="btn btn-primary" id="refresh-request-records">🔄 刷新记录</button>
+                        <span id="total-requests-today" style="color: #ff5722; margin-left: 15px; vertical-align: middle; font-size: 1.2em; font-weight: bold;"></span>
+                    </div>
+                    <span style="color: #666;">云服务部署需要配置redis</span>
+                </div>
+                <div class="request-records-container" id="request-records-list"></div>
             </div>
 
             <!-- 系统配置 -->
@@ -253,11 +282,12 @@ export const HTML_TEMPLATE = /* html */ `
                         <option value="number">数字 (1-100)</option>
                         <option value="select">单选</option>
                         <option value="multi-select">多选 (可排序)</option>
+                        <option value="map">映射</option>
                     </select>
                 </div>
                 <div class="form-group" id="value-input-container">
                     <!-- 动态渲染的值输入控件 -->
-                </div>
+                    </div>
                 <div class="form-group">
                     <label>描述</label>
                     <textarea id="env-description" placeholder="配置项说明" readonly></textarea>
@@ -273,7 +303,7 @@ export const HTML_TEMPLATE = /* html */ `
     <!-- 项目声明 -->
     <footer class="footer">
         <p class="footer-text">
-            一个人人都能部署的基于 js 的弹幕 API 服务器，支持爱优腾芒哔人韩巴弹幕直接获取，兼容弹弹play的搜索、详情查询和弹幕获取接口规范，并提供日志记录，支持vercel/netlify/edgeone/cloudflare/docker/claw等部署方式，不用提前下载弹幕，没有nas或小鸡也能一键部署。
+            一个人人都能部署的基于 js 的弹幕 API 服务器，支持爱优腾芒哔咪人韩巴狐乐西弹幕直接获取，兼容弹弹play的搜索、详情查询和弹幕获取接口规范，并提供日志记录，支持vercel/netlify/edgeone/cloudflare/docker/claw等部署方式，不用提前下载弹幕，没有nas或小鸡也能一键部署。
         </p>
         <p class="footer-text">本项目仅为个人爱好开发，代码开源。如有任何侵权行为，请联系本人删除。</p>
         <p class="footer-links">
@@ -294,6 +324,7 @@ export const HTML_TEMPLATE = /* html */ `
         ${logviewJsContent}
         ${apitestJsContent}
         ${pushDanmuJsContent}
+        ${requestRecordsJsContent}
         ${systemSettingsJsContent}
     </script>
 </body>
