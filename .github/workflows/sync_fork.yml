@@ -2,7 +2,7 @@ name: Fork Sync
 
 permissions:
     contents: write
-    workflows: write  # 允许更新工作流文件，解决当前报错
+    actions: write  # 修正：使用 actions: write 来获取修改工作流文件的权限
 
 on:
     schedule:
@@ -20,7 +20,7 @@ jobs:
               uses: actions/checkout@v4
               with:
                 token: ${{ secrets.GITHUB_TOKEN }}
-                fetch-depth: 0 # 保持这个，防止历史记录不全
+                fetch-depth: 0 
 
             - name: Sync Upstream
               uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
