@@ -39,7 +39,7 @@ export default class HanjutvSource extends BaseSource {
     this._mobileMakeHeaders = null;
     this._tvMakeHeaders = null;
     this._mobileWarmupPromise = null;
-    this._mobileWarmupAttempted = false;
+    this._mobileWarmedUid = null;
   }
 
   getDanmuHeaders() {
@@ -99,7 +99,7 @@ export default class HanjutvSource extends BaseSource {
    * 统一的错误日志格式
    */
   logError(tag, error) {
-    log("error", `[Hanjutv] ${tag}:`, {
+    log("error", `[hanjutv] ${tag}:`, {
       message: error.message,
       name: error.name,
       stack: error.stack,
@@ -212,13 +212,180 @@ export default class HanjutvSource extends BaseSource {
     return Array.from(map.values());
   }
 
-  isMergeableSearchPair(leftItem, rightItem, keyword = "") {
-    if (!leftItem?.name || !rightItem?.name) return false;
-    if (keyword) {
-      if (!titleMatches(leftItem.name, keyword) || !titleMatches(rightItem.name, keyword)) return false;
+  // 双端身份键只做 Unicode 兼容归一与首尾去空白，不使用模糊标题清洗。
+  normalizeSearchPairTitle(name = "") {
+    return String(name || "").normalize("NFKC").trim();
+  }
+
+  getSearchPairYear(item) {
+    const rawYear = item?.publishTime ?? item?.releaseTime ?? item?.year ?? null;
+    const yearText = String(rawYear ?? "").trim();
+    const isReasonableYear = year => Number.isInteger(year) && year >= 1900 && year <= 2100;
+    const parseDateYear = value => {
+      const parsed = new Date(value);
+      const year = parsed.getUTCFullYear();
+      return isReasonableYear(year) ? year : null;
+    };
+
+    if (/^(?:19|20)\d{2}$/.test(yearText)) return Number(yearText);
+
+    const compactDateMatch = yearText.match(/^((?:19|20)\d{2})\d{4}$/);
+    if (compactDateMatch) return Number(compactDateMatch[1]);
+
+    if (rawYear !== null && rawYear !== "") {
+      const numericValue = Number(rawYear);
+      if (Number.isFinite(numericValue)) {
+        if (numericValue !== 0) {
+          const absoluteValue = Math.abs(numericValue);
+          let timestamp = null;
+          if (absoluteValue >= 10_000_000_000) {
+            timestamp = numericValue;
+          } else if (absoluteValue >= 100_000_000) {
+            timestamp = numericValue * 1000;
+          }
+
+          const year = timestamp === null ? null : parseDateYear(timestamp);
+          if (year !== null) return year;
+        }
+      } else if (yearText) {
+        const year = parseDateYear(yearText);
+        if (year !== null) return year;
+      }
     }
 
-    return titleMatches(leftItem.name, rightItem.name) && titleMatches(rightItem.name, leftItem.name);
+    const memoMatch = String(item?.searchMemo || "").match(/(?:19|20)\d{2}/);
+    return memoMatch ? Number(memoMatch[0]) : null;
+  }
+
+  getSearchPairEpisodeCount(item) {
+    const value = Number(item?.lastSerialNo ?? item?.totalEpisode ?? item?.episodeCount);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  getSearchPairMetadata(item) {
+    const normalizeValue = value => {
+      if (value === undefined || value === null) return null;
+      const normalized = String(value).trim();
+      return normalized || null;
+    };
+    return {
+      playMode: normalizeValue(item?.playMode),
+      year: normalizeValue(this.getSearchPairYear(item)),
+      episodeCount: normalizeValue(this.getSearchPairEpisodeCount(item)),
+      category: normalizeValue(item?.category),
+    };
+  }
+
+  // titleMatches 只负责关键词相关性；S5↔TV 是否为同一实体必须满足精确标题与强元数据约束。
+  isMergeableSearchPair(leftItem, rightItem) {
+    const leftTitle = this.normalizeSearchPairTitle(leftItem?.name);
+    const rightTitle = this.normalizeSearchPairTitle(rightItem?.name);
+    if (!leftTitle || !rightTitle || leftTitle !== rightTitle) return false;
+
+    const leftMeta = this.getSearchPairMetadata(leftItem);
+    const rightMeta = this.getSearchPairMetadata(rightItem);
+    for (const field of ["playMode", "year", "category"]) {
+      if (leftMeta[field] !== null && rightMeta[field] !== null && leftMeta[field] !== rightMeta[field]) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  getSearchPairMatchScore(leftItem, rightItem) {
+    if (!this.isMergeableSearchPair(leftItem, rightItem)) return null;
+    const leftMeta = this.getSearchPairMetadata(leftItem);
+    const rightMeta = this.getSearchPairMetadata(rightItem);
+    const weights = { year: 8, playMode: 4, category: 2, episodeCount: 1 };
+    let score = 0;
+
+    for (const [field, weight] of Object.entries(weights)) {
+      if (leftMeta[field] !== null && rightMeta[field] !== null && leftMeta[field] === rightMeta[field]) {
+        score += weight;
+      }
+    }
+
+    return score;
+  }
+
+  selectUniqueBestSearchCandidate(item, candidates = []) {
+    const scored = candidates
+      .map(candidate => ({ candidate, score: this.getSearchPairMatchScore(item, candidate) }))
+      .filter(entry => entry.score !== null);
+    if (scored.length === 0) return null;
+
+    const bestScore = Math.max(...scored.map(entry => entry.score));
+    const best = scored.filter(entry => entry.score === bestScore);
+    return best.length === 1 ? best[0].candidate : null;
+  }
+
+  pairSearchCandidateGroup(s5Items = [], tvItems = []) {
+    const remainingS5 = new Map(s5Items.map(item => [String(item.sid), item]));
+    const remainingTv = new Map(tvItems.map(item => [String(item.sid), item]));
+    const pairedTvByS5Sid = new Map();
+
+    while (remainingS5.size > 0 && remainingTv.size > 0) {
+      const currentS5 = Array.from(remainingS5.values());
+      const currentTv = Array.from(remainingTv.values());
+      const bestTvByS5Sid = new Map();
+      const bestS5ByTvSid = new Map();
+
+      for (const s5Item of currentS5) {
+        const bestTv = this.selectUniqueBestSearchCandidate(s5Item, currentTv);
+        if (bestTv) bestTvByS5Sid.set(String(s5Item.sid), bestTv);
+      }
+      for (const tvItem of currentTv) {
+        const bestS5 = this.selectUniqueBestSearchCandidate(tvItem, currentS5);
+        if (bestS5) bestS5ByTvSid.set(String(tvItem.sid), bestS5);
+      }
+
+      const mutualPairs = [];
+      for (const [s5Sid, tvItem] of bestTvByS5Sid) {
+        const tvSid = String(tvItem.sid);
+        const bestS5 = bestS5ByTvSid.get(tvSid);
+        if (bestS5 && String(bestS5.sid) === s5Sid) {
+          mutualPairs.push({ s5Sid, tvSid, tvItem });
+        }
+      }
+
+      if (mutualPairs.length === 0) break;
+      for (const pair of mutualPairs) {
+        pairedTvByS5Sid.set(pair.s5Sid, pair.tvItem);
+        remainingS5.delete(pair.s5Sid);
+        remainingTv.delete(pair.tvSid);
+      }
+    }
+
+    return pairedTvByS5Sid;
+  }
+
+  pairSearchCandidates(s5Items = [], tvItems = []) {
+    const groupByTitle = items => {
+      const groups = new Map();
+      for (const item of items) {
+        const title = this.normalizeSearchPairTitle(item?.name);
+        if (!title) continue;
+        if (!groups.has(title)) groups.set(title, []);
+        groups.get(title).push(item);
+      }
+      return groups;
+    };
+
+    const s5Groups = groupByTitle(s5Items);
+    const tvGroups = groupByTitle(tvItems);
+    const pairedTvByS5Sid = new Map();
+
+    for (const [title, s5Group] of s5Groups) {
+      const tvGroup = tvGroups.get(title);
+      if (!tvGroup) continue;
+      const groupPairs = this.pairSearchCandidateGroup(s5Group, tvGroup);
+      for (const [s5Sid, tvItem] of groupPairs) {
+        pairedTvByS5Sid.set(s5Sid, tvItem);
+      }
+    }
+
+    return pairedTvByS5Sid;
   }
 
   buildSearchCandidate(item, variant, linkedSid = "") {
@@ -256,12 +423,12 @@ export default class HanjutvSource extends BaseSource {
     const hasMatched = s5.matched.length + tv.matched.length > 0;
 
     const resultList = [];
-    const usedTvSids = new Set();
+    const pairedTvByS5Sid = this.pairSearchCandidates(s5.matched, tv.matched);
+    const usedTvSids = new Set(Array.from(pairedTvByS5Sid.values(), item => String(item.sid)));
 
     for (const item of s5.matched) {
-      const pairedTv = tv.matched.find(candidate => !usedTvSids.has(String(candidate.sid)) && this.isMergeableSearchPair(item, candidate, keyword));
+      const pairedTv = pairedTvByS5Sid.get(String(item.sid));
       if (pairedTv) {
-        usedTvSids.add(String(pairedTv.sid));
         resultList.push(this.buildSearchCandidate(item, HANJUTV_VARIANTS.MERGED, pairedTv.sid));
       } else {
         resultList.push(this.buildSearchCandidate(item, HANJUTV_VARIANTS.HXQ));
@@ -311,58 +478,93 @@ export default class HanjutvSource extends BaseSource {
    */
   async extractFromPayload(payload, uid, tag) {
     if (!payload || typeof payload !== "object") throw new Error(`${tag} 响应为空`);
+    const code = payload.rescode ?? payload.code;
+    if (code != null && Number(code) !== 0) throw new Error(`${tag} 接口返回错误: ${code}`);
 
+    let data = payload;
     if (typeof payload.data === "string" && payload.data.length > 0) {
-      let decoded;
       try {
-        decoded = await decodeHanjutvEncryptedPayload(payload, uid);
+        data = await decodeHanjutvEncryptedPayload(payload, uid);
       } catch (error) {
         throw new Error(`${tag} 响应解密失败: ${error.message}`);
       }
-      const items = this.extractSearchItems(decoded);
-      if (items.length === 0) throw new Error(`${tag} 解密后无有效结果`);
-      return items;
     }
 
-    const items = this.extractSearchItems(payload);
-    if (items.length === 0) throw new Error(`${tag} 无有效结果`);
+    // 明确的空列表表示没有匹配结果；只有缺少列表的空壳或无效数据才需要恢复。
+    const list = data?.seriesData?.seriesList ?? data?.seriesList ?? data?.seriesData?.series;
+    if (!Array.isArray(list)) throw new Error(`${tag} 响应缺少有效搜索列表`);
+    if (list.length === 0) {
+      log("info", `[hanjutv] ${tag} 搜索无结果`);
+      return [];
+    }
+    const items = this.extractSearchItems(data);
+    if (items.length === 0) throw new Error(`${tag} 搜索列表无有效条目`);
     return items;
   }
 
-  async warmupMobileIdentity(headers) {
+  async warmupMobileIdentity(headers, bypassCache = false) {
     try {
-      await httpGet(`${this.appHost}/api/common/configs`, { headers, timeout: 8000, retries: 0 });
-    } catch (_) {
-      // 暖身失败不阻断搜索
+      const resp = await httpGet(`${this.appHost}/api/common/configs`, {
+        headers, timeout: 3000, retries: 0, bypassCache,
+      });
+      const data = resp?.data;
+      if (data?.rescode !== 0 || !data.globalConfigs || typeof data.globalConfigs !== "object"
+        || Array.isArray(data.globalConfigs) || !Array.isArray(data.tabs)) {
+        throw new Error("configs 响应缺少有效初始化配置");
+      }
+      return true;
+    } catch (error) {
+      log("warn", `[hanjutv] 手机身份初始化失败: ${error.message}`);
+      return false;
     }
   }
 
-  async ensureMobileIdentityWarmed() {
-    if (this._mobileWarmupAttempted) {
-      await this._mobileWarmupPromise;
-      return;
-    }
+  async ensureMobileIdentityWarmed(bypassCache = false) {
+    if (this._mobileWarmedUid) return true;
+    if (this._mobileWarmupPromise) return this._mobileWarmupPromise;
 
-    this._mobileWarmupAttempted = true;
-    this._mobileWarmupPromise = (async () => {
+    const warmupPromise = (async () => {
       const headerInfo = await this.buildMobileHeaders();
-      await this.warmupMobileIdentity(headerInfo.headers);
+      if (this._mobileWarmedUid === headerInfo.uid) return true;
+
+      const warmed = await this.warmupMobileIdentity(headerInfo.headers, bypassCache);
+      if (warmed) this._mobileWarmedUid = headerInfo.uid;
+      return warmed;
     })();
 
-    await this._mobileWarmupPromise;
+    this._mobileWarmupPromise = warmupPromise;
+    try {
+      return await warmupPromise;
+    } finally {
+      if (this._mobileWarmupPromise === warmupPromise) {
+        this._mobileWarmupPromise = null;
+      }
+    }
   }
 
   async searchWithS5Api(keyword) {
-    await this.ensureMobileIdentityWarmed();
-
-    const { uid, headers } = await this.buildMobileHeaders();
     const q = encodeURIComponent(keyword);
-    const resp = await httpGet(`https://hxqapi.hiyun.tv/api/search/s5?k=${q}&srefer=search_input&type=0&page=1`, {
-      headers,
-      timeout: 10000,
-      retries: 1,
-    });
-    return this.extractFromPayload(resp?.data, uid, "s5");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (!await this.ensureMobileIdentityWarmed(attempt > 0)) {
+          throw new Error("s5 手机身份初始化失败");
+        }
+        const { uid, headers } = await this.buildMobileHeaders();
+        const resp = await httpGet(`${this.appHost}/api/search/s5?k=${q}&srefer=search_input&type=0&page=1`, {
+          headers,
+          timeout: 10000,
+          // 恢复由外层统一控制，避免叠加 HTTP 重试；恢复请求必须绕过异常响应缓存。
+          retries: 0,
+          bypassCache: attempt > 0,
+        });
+        return await this.extractFromPayload(resp?.data, uid, "s5");
+      } catch (error) {
+        // 保留原身份，只重新初始化一次；仍失败则由 search() 保留 TV 端结果。
+        this._mobileWarmedUid = null;
+        if (attempt === 1) throw error;
+        log("warn", `[hanjutv] s5 搜索异常，重新初始化并重试一次: ${error.message}`);
+      }
+    }
   }
 
   async searchWithTvApi(keyword) {
@@ -382,26 +584,26 @@ export default class HanjutvSource extends BaseSource {
       if (!key) return [];
 
       const [s5List, tvList] = await Promise.all([
-        this.tryGet(() => this.searchWithS5Api(key), [], `[Hanjutv] s5 搜索失败`),
-        this.tryGet(() => this.searchWithTvApi(key), [], `[Hanjutv] TV 搜索失败`),
+        this.tryGet(() => this.searchWithS5Api(key), [], `[hanjutv] s5 搜索失败`),
+        this.tryGet(() => this.searchWithTvApi(key), [], `[hanjutv] TV 搜索失败`),
       ]);
 
       const { resultList, stats } = this.mergeSearchCandidates(key, s5List, tvList);
       const totalMatched = stats.s5Matched + stats.tvMatched;
 
       if (resultList.length > 0 && totalMatched === 0) {
-        log("warn", `[Hanjutv] 所有候选均未命中关键词，丢弃疑似推荐流结果: ${key}`);
+        log("info", `[hanjutv] 所有候选均未命中关键词，丢弃疑似推荐流结果: ${key}`);
         return [];
       }
 
       if (resultList.length === 0) {
-        log("info", "[Hanjutv] hanjutvSearchresp: s5 与 TV 接口均无有效结果");
+        log("info", "[hanjutv] hanjutvSearchresp: s5 与 TV 接口均无有效结果");
         return [];
       }
 
-      log("info", `[Hanjutv] 搜索候选统计 s5MatchedList=${JSON.stringify(stats.s5MatchedList)}, s5UnmatchedList=${JSON.stringify(stats.s5UnmatchedList)}, tvMatchedList=${JSON.stringify(stats.tvMatchedList)}, tvUnmatchedList=${JSON.stringify(stats.tvUnmatchedList)}`);
-      log("info", `[Hanjutv] 搜索候选统计 s5=${stats.s5Total}(命中${stats.s5Matched}), tv=${stats.tvTotal}(命中${stats.tvMatched}), merged=${stats.mergedCount}`);
-      log("info", `[Hanjutv] 搜索找到 ${resultList.length} 个有效结果`);
+      log("info", `[hanjutv] 搜索候选统计 s5MatchedList=${JSON.stringify(stats.s5MatchedList)}, s5UnmatchedList=${JSON.stringify(stats.s5UnmatchedList)}, tvMatchedList=${JSON.stringify(stats.tvMatchedList)}, tvUnmatchedList=${JSON.stringify(stats.tvUnmatchedList)}`);
+      log("info", `[hanjutv] 搜索候选统计 s5=${stats.s5Total}(命中${stats.s5Matched}), tv=${stats.tvTotal}(命中${stats.tvMatched}), merged=${stats.mergedCount}`);
+      log("info", `[hanjutv] 搜索找到 ${resultList.length} 个有效结果`);
 
       return resultList.filter(Boolean);
     } catch (error) {
@@ -417,7 +619,7 @@ export default class HanjutvSource extends BaseSource {
       const sid = String(id || "").trim();
       if (!sid) return null;
       const detail = await this.tryGet(() => loader(sid), null, errorTag);
-      if (!detail) { log("info", `[Hanjutv] ${missingLogTag}: series 不存在`); return null; }
+      if (!detail) { log("info", `[hanjutv] ${missingLogTag}: series 不存在`); return null; }
       return detail;
     } catch (error) { this.logError(errorTag, error); return null; }
   }
@@ -482,7 +684,7 @@ export default class HanjutvSource extends BaseSource {
       }
 
       if (episodes.length === 0) {
-        log("info", "[Hanjutv] getHanjutvHxqEpisodes: episodes 不存在");
+        log("info", "[hanjutv] getHanjutvHxqEpisodes: episodes 不存在");
         return [];
       }
 
@@ -504,7 +706,7 @@ export default class HanjutvSource extends BaseSource {
       }, [], "getHanjutvTvEpisodes error");
 
       if (episodes.length === 0) {
-        log("info", "[Hanjutv] getHanjutvTvEpisodes: episodes 不存在");
+        log("info", "[hanjutv] getHanjutvTvEpisodes: episodes 不存在");
         return [];
       }
 
@@ -672,7 +874,7 @@ export default class HanjutvSource extends BaseSource {
    */
   async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null, querySeason = null) {
     if (!Array.isArray(sourceAnimes)) {
-      log("error", "[Hanjutv] sourceAnimes is not a valid array");
+      log("error", "[hanjutv] sourceAnimes is not a valid array");
       return [];
     }
 
@@ -694,24 +896,33 @@ export default class HanjutvSource extends BaseSource {
       // 如果已命中目标，减少详情请求量
       if (seasonFiltered.length > 0) {
         filteredAnimes = seasonFiltered;
-        log("info", `[Hanjutv] 结果已命中目标季(第${resolvedQuerySeason}季)，跳过非目标季相关请求`);
+        log("info", `[hanjutv] 结果已命中目标季(第${resolvedQuerySeason}季)，跳过非目标季相关请求`);
       }
     }
 
-    await Promise.all(
+    const payloads = await Promise.all(
       filteredAnimes.map(async (anime) => {
-          try {
-            const payload = await this.buildAnimePayload(anime);
-            if (!payload || !payload.summary || !Array.isArray(payload.links) || payload.links.length === 0) return;
-
-            tmpAnimes.push(payload.summary);
-            addAnime({ ...payload.summary, links: payload.links }, detailStore);
-            if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
-          } catch (error) {
-            log("error", `[Hanjutv] Error processing anime: ${error.message}`);
-          }
-        })
+        try {
+          const payload = await this.buildAnimePayload(anime);
+          if (!payload || !payload.summary || !Array.isArray(payload.links) || payload.links.length === 0) return null;
+          return payload;
+        } catch (error) {
+          log("error", `[hanjutv] Error processing anime: ${error.message}`);
+          return null;
+        }
+      })
     );
+
+    for (const payload of payloads) {
+      if (!payload) continue;
+      try {
+        tmpAnimes.push(payload.summary);
+        addAnime({ ...payload.summary, links: payload.links }, detailStore);
+        if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
+      } catch (error) {
+        log("error", `[hanjutv] Error processing anime: ${error.message}`);
+      }
+    }
 
     this.sortAndPushAnimesByYear(tmpAnimes, curAnimes);
     return tmpAnimes;
@@ -833,7 +1044,7 @@ export default class HanjutvSource extends BaseSource {
   }
 
   async getEpisodeDanmuSegments(id) {
-    log("info", "[Hanjutv] 获取韩剧TV弹幕分段列表...", id);
+    log("info", "[hanjutv] 获取韩剧TV弹幕分段列表...", id);
 
     // 韩剧TV 当前没有可复用的分片清单接口，统一走整集拉取。
     return new SegmentListResponse({
